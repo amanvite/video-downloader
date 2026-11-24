@@ -1,6 +1,6 @@
-# VideoHunt
+# Video Downloader
 
-**VideoHunt** is a high-speed, local-first web application for inspecting and downloading publicly accessible video and audio streams. Built with Node.js, Express, React 18, `yt-dlp`, and `ffmpeg`, it streams progressive H.264 MP4 video and MP3 audio directly into your browser's native download manager with parallel byte-range prefetching.
+**Video Downloader** is a high-speed, local-first web application for inspecting and downloading publicly accessible video and audio streams. Built with Node.js, Express, React 18, `yt-dlp`, and `ffmpeg`, it streams progressive H.264 MP4 video and MP3 audio directly into your browser's native download manager with parallel byte-range prefetching.
 
 
 
@@ -27,7 +27,7 @@
 
 ## Privacy Policy
 
-- **Zero Personal Data Collection**: VideoHunt operates locally without user accounts, registration, cookies, analytics trackers, or telemetry.
+- **Zero Personal Data Collection**: Video Downloader operates locally without user accounts, registration, cookies, analytics trackers, or telemetry.
 - **Ephemeral In-Memory Processing**: Submitted URLs are cached temporarily in volatile memory (`LruCache`) solely to resolve stream metadata and are automatically purged upon expiration.
 - **Direct Stream Piping**: Media streams are piped directly from the source CDN to your browser's download manager without permanent server-side storage or logging.
 
@@ -35,8 +35,8 @@
 
 ## Legal Disclaimer
 
-- **Authorized & Educational Use Only**: VideoHunt is provided strictly as a local educational utility for downloading user-owned media, Public Domain works, Creative Commons content, or material for which the user holds explicit permission from the copyright owner.
-- **No DRM Circumvention**: VideoHunt processes only publicly accessible HTTP/HTTPS streams and does not decrypt, strip, or bypass Digital Rights Management (DRM), paywalls, or private authentication gates.
+- **Authorized & Educational Use Only**: Video Downloader is provided strictly as a local educational utility for downloading user-owned media, Public Domain works, Creative Commons content, or material for which the user holds explicit permission from the copyright owner.
+- **No DRM Circumvention**: Video Downloader processes only publicly accessible HTTP/HTTPS streams and does not decrypt, strip, or bypass Digital Rights Management (DRM), paywalls, or private authentication gates.
 - **Limitation of Liability**: This software is provided *"AS IS"* without warranties of any kind. The end user assumes full legal responsibility for complying with applicable copyright laws and the Terms of Service of any third-party website accessed through this tool.
 
 
