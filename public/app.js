@@ -151,7 +151,7 @@
       const params = new URLSearchParams(window.location.search);
       if (params.get('apology')) {
         setApologyText(
-          'We apologize, but VideoHunt is unable to extract a downloadable video from that link right now. Please try another video URL.'
+          'We apologize, but Video Downloader is unable to extract a downloadable video from that link right now. Please try another video URL.'
         );
         setCanRetry(false);
         window.history.replaceState({}, '', '/');
@@ -187,17 +187,17 @@
       abortControllerRef.current = controller;
 
       setIsLoading(true);
-      setLoadingStage('Connecting to media source and inspecting available streams...');
+      setLoadingStage('Connecting to media source and checking available streams...');
       setApologyText('');
       setCanRetry(false);
       setMediaData(null);
 
       const stageTimer1 = setTimeout(() => {
-        setLoadingStage('Deep-scanning video qualities and verifying H.264 stream tracks...');
+        setLoadingStage('Scanning video qualities and verifying MP4 stream tracks...');
       }, 2600);
 
       const stageTimer2 = setTimeout(() => {
-        setLoadingStage('Resolving embedded player metadata and stream manifests...');
+        setLoadingStage('Resolving embedded player metadata and stream links...');
       }, 7500);
 
       try {
@@ -215,7 +215,7 @@
         if (!res.ok || data?.error || !hasStreams) {
           setApologyText(
             data?.error ||
-              'We apologize, but VideoHunt could not find any downloadable video streams on this link. Please verify that the URL points directly to a public video.'
+              'We apologize, but Video Downloader could not find any downloadable video streams on this link. Please verify that the URL points directly to a public video.'
           );
           setCanRetry(true);
           return false;
@@ -235,7 +235,7 @@
 
         if (!serverOnline) {
           setApologyText(
-            'Cannot reach the local VideoHunt server on localhost:3000. Make sure "npm start" is running in your terminal, then click Retry.'
+            'Cannot reach the local Video Downloader server on localhost:3000. Make sure "npm start" is running in your terminal, then click Retry.'
           );
         } else {
           setApologyText(
@@ -730,7 +730,7 @@
             <span className="brand-glyph">
               <${BrandDownloadIcon} />
             </span>
-            <span className="brand-name">VideoHunt</span>
+            <span className="brand-name">Video Downloader</span>
           </a>
         </div>
         ${subtitle && html`<h1 className="page-subtitle">${subtitle}</h1>`}
@@ -743,7 +743,7 @@
 
           ${activeView === 'home' && html`
             <section className="view-panel active">
-              <${BrandHeader} subtitle=${selectedSite ? `${selectedSite} Video Downloader` : ''} />
+              <${BrandHeader} subtitle=${selectedSite ? `Download from ${selectedSite}` : ''} />
 
               <div className="search-box-wrap">
                 <form className="google-omnibox" onSubmit=${handleFormSubmit} autoComplete="off" noValidate>
@@ -754,7 +754,7 @@
                     ref=${inputRef}
                     type="text"
                     inputMode="url"
-                    name="vh_stream_target_field"
+                    name="vd_stream_target_field"
                     className="omnibox-input"
                     value=${urlInput}
                     readOnly=${!inputUnlocked}
@@ -844,25 +844,25 @@
 
               <div className="highlights-bento">
                 <div className="highlight-card">
-                  <span className="highlight-card-badge">INSTANT STREAM</span>
-                  <h3>Zero-Wait Browser Download</h3>
-                  <p>Streams directly into your browser's download manager from the first millisecond with continuous packet flushing.</p>
+                  <span className="highlight-card-badge">FAST DOWNLOADS</span>
+                  <h3>Starts Right Away</h3>
+                  <p>Downloads begin immediately in your browser without waiting for the file to load first.</p>
                 </div>
                 <div className="highlight-card">
-                  <span className="highlight-card-badge">H.264 + MP3</span>
-                  <h3>Native Player Compatibility</h3>
-                  <p>Delivers progressive H.264 MP4 video and 320kbps MP3 audio compatible with Windows, Mac, iOS, and Android.</p>
+                  <span className="highlight-card-badge">MP4 & MP3</span>
+                  <h3>Works on Any Device</h3>
+                  <p>Saves standard MP4 videos and MP3 audio files that play smoothly on Windows, Mac, Android, and iPhone.</p>
                 </div>
                 <div className="highlight-card">
-                  <span className="highlight-card-badge">REAL QUALITIES</span>
-                  <h3>True Stream Verification</h3>
-                  <p>Inspects every video link in real time to display only the genuine resolutions and file sizes available.</p>
+                  <span className="highlight-card-badge">ACCURATE SIZES</span>
+                  <h3>Real Quality Options</h3>
+                  <p>Checks each link live to show only the actual video qualities and file sizes you can download.</p>
                 </div>
               </div>
 
               <div className="seo-description-block">
                 <p>
-                  VideoHunt makes it easy to save ${selectedSite ? `${selectedSite} ` : ''}videos and audio directly to your device for offline viewing. Just paste a link, pick the quality you want, and start downloading right away.
+                  Video Downloader makes it easy to save ${selectedSite ? `${selectedSite} ` : ''}videos and audio directly to your device for offline viewing. Just paste a link, pick the quality you want, and start downloading right away.
                 </p>
                 <p>
                   It checks every link in real time so you only see the MP4 video and MP3 audio options that are actually available. Use it only for your own content, public-domain media, or videos you have permission to download.

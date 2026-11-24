@@ -10,11 +10,11 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 // prevent any unexpected stream or socket abort from stopping the local server
 process.on('uncaughtException', err => {
-  console.error('[VideoHunt Recoverable Exception]:', err?.message || err);
+  console.error('[Video Downloader Recoverable Exception]:', err?.message || err);
 });
 
 process.on('unhandledRejection', reason => {
-  console.error('[VideoHunt Recoverable Rejection]:', reason?.message || reason);
+  console.error('[Video Downloader Recoverable Rejection]:', reason?.message || reason);
 });
 
 const express = require('express');
@@ -47,7 +47,9 @@ function cleanupOrphanTempFiles() {
     const entries = fs.readdirSync(TEMP_DIR);
 
     for (const name of entries) {
-      if (!name.startsWith('vh_audio_') && !name.startsWith('chrome_prof_')) continue;
+      if (!name.startsWith('vh_audio_') && !name.startsWith('vd_audio_') && !name.startsWith('chrome_prof_')) {
+        continue;
+      }
       const fullPath = path.join(TEMP_DIR, name);
       try {
         const stat = fs.statSync(fullPath);
@@ -78,8 +80,8 @@ app.use(express.static(PUBLIC_DIR));
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    name: 'VideoHunt',
-    version: '10.0.0',
+    name: 'Video Downloader',
+    version: '10.1.0',
     runtime: 'local-node',
     uptimeSec: Math.round(process.uptime()),
     stats: getEngineStats()
@@ -180,7 +182,7 @@ app.post('/api/info', async (req, res) => {
 
   return res.status(422).json({
     error:
-      'We apologize, but VideoHunt could not find any downloadable video streams on this link. Please verify that the URL points directly to a public video.'
+      'We apologize, but Video Downloader could not find any downloadable video streams on this link. Please verify that the URL points directly to a public video.'
   });
 });
 
@@ -221,19 +223,17 @@ app.use((req, res) => {
 initLocalBinaries();
 
 const server = app.listen(PORT, () => {
-  console.log(`VideoHunt v10.0 running at http://localhost:${PORT}`);
+  console.log(`Video Downloader v10.1 running at http://localhost:${PORT}`);
 });
 
 server.on('error', err => {
   if (err && err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. Close the existing VideoHunt terminal or stop the process using port ${PORT}.`);
+    console.error(`Port ${PORT} is already in use. Close the existing Video Downloader terminal or stop the process using port ${PORT}.`);
     process.exit(1);
   }
   console.error('[Server Error]:', err?.message || err);
 });
 
-// keep requestTimeout disabled for large video downloads while maintaining healthy keep-alive intervals
-// (setting keepAliveTimeout = 0 in Node 22+ causes immediate socket resets and "Failed to fetch" in Chrome)
 server.timeout = 0;
 server.requestTimeout = 0;
 server.keepAliveTimeout = 65000;
