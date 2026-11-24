@@ -18,17 +18,50 @@ process.on('unhandledRejection', reason => {
 });
 
 const express = require('express');
+const fs = require('fs');
 const path = require('path');
-const { PORT, BROWSER_UA, BUILTIN_EXTRACTORS, normalizeInputUrl } = require('./src/config');
+const {
+  PORT,
+  TEMP_DIR,
+  BROWSER_UA,
+  BUILTIN_EXTRACTORS,
+  normalizeInputUrl
+} = require('./src/config');
 const { initLocalBinaries } = require('./src/extractor');
 const {
   inspectMediaUrl,
   streamMediaToResponse,
-  handleInternalChunkProxy
+  handleInternalChunkProxy,
+  getEngineStats
 } = require('./src/downloader');
 
 const app = express();
 const PUBLIC_DIR = path.join(__dirname, 'public');
+
+// sweep orphaned temporary audio/profile artifacts older than 20 minutes
+function cleanupOrphanTempFiles() {
+  try {
+    if (!fs.existsSync(TEMP_DIR)) return;
+    const now = Date.now();
+    const maxAgeMs = 20 * 60 * 1000;
+    const entries = fs.readdirSync(TEMP_DIR);
+
+    for (const name of entries) {
+      if (!name.startsWith('vh_audio_') && !name.startsWith('chrome_prof_')) continue;
+      const fullPath = path.join(TEMP_DIR, name);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (now - stat.mtimeMs > maxAgeMs) {
+          fs.rmSync(fullPath, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+cleanupOrphanTempFiles();
+const tempCleanupTimer = setInterval(cleanupOrphanTempFiles, 15 * 60 * 1000);
+tempCleanupTimer.unref();
 
 app.disable('x-powered-by');
 app.use((req, res, next) => {
@@ -41,13 +74,15 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(PUBLIC_DIR));
 
-// GET /api/health
+// GET /api/health - server heartbeat & runtime diagnostics
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     name: 'VideoHunt',
-    version: '9.0.0',
-    runtime: 'local-node'
+    version: '10.0.0',
+    runtime: 'local-node',
+    uptimeSec: Math.round(process.uptime()),
+    stats: getEngineStats()
   });
 });
 
@@ -68,14 +103,14 @@ app.get('/api/proxy-image', async (req, res) => {
         'User-Agent': BROWSER_UA,
         'Referer': parsed.origin + '/'
       },
-      signal: AbortSignal.timeout(6000)
+      signal: AbortSignal.timeout(7000)
     });
 
     if (!imgRes.ok && parsed.hostname.includes('ytimg.com') && parsed.pathname.includes('maxresdefault')) {
       const fallbackThumb = parsed.href.replace('maxresdefault', 'hqdefault');
       imgRes = await fetch(fallbackThumb, {
         headers: { 'User-Agent': BROWSER_UA },
-        signal: AbortSignal.timeout(6000)
+        signal: AbortSignal.timeout(7000)
       });
     }
 
@@ -89,10 +124,19 @@ app.get('/api/proxy-image', async (req, res) => {
   }
 });
 
-// GET /api/chunk-proxy - internal high-speed range-window proxy feeding local FFmpeg without CDN throttling
+// HEAD & GET /api/chunk-proxy - internal high-speed range-window proxy feeding local FFmpeg
+app.head('/api/chunk-proxy', async (req, res) => {
+  try {
+    await handleInternalChunkProxy(req, res, true);
+  } catch {
+    if (!res.headersSent) res.status(502).end();
+    else try { res.end(); } catch {}
+  }
+});
+
 app.get('/api/chunk-proxy', async (req, res) => {
   try {
-    await handleInternalChunkProxy(req, res);
+    await handleInternalChunkProxy(req, res, false);
   } catch {
     if (!res.headersSent) res.status(502).end();
     else try { res.end(); } catch {}
@@ -101,7 +145,7 @@ app.get('/api/chunk-proxy', async (req, res) => {
 
 // POST /api/info - accepts links with or without http:// or https://
 app.post('/api/info', async (req, res) => {
-  const { url } = req.body || {};
+  const { url, forceRefresh = false } = req.body || {};
   if (!url || !String(url).trim()) {
     return res.status(400).json({ error: 'Please paste a video link.' });
   }
@@ -110,11 +154,13 @@ app.post('/api/info', async (req, res) => {
   try {
     normalizedUrl = normalizeInputUrl(url);
   } catch {
-    return res.status(400).json({ error: 'Please enter a valid website link (e.g. youtube.com/watch?v=...).' });
+    return res.status(400).json({
+      error: 'Please enter a valid website link (for example: youtube.com/watch?v=...).'
+    });
   }
 
   try {
-    const info = await inspectMediaUrl(normalizedUrl);
+    const info = await inspectMediaUrl(normalizedUrl, Boolean(forceRefresh));
     if (info && info.videoFormats?.length > 0) {
       return res.json({
         normalizedUrl,
@@ -157,6 +203,16 @@ app.get('/api/download', async (req, res) => {
   }
 });
 
+// global Express error boundary
+app.use((err, req, res, _next) => {
+  console.error('[Express Error]:', err?.message || err);
+  if (!res.headersSent) {
+    res.status(500).json({
+      error: 'An unexpected server error occurred. Please try again.'
+    });
+  }
+});
+
 // SPA fallback
 app.use((req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
@@ -165,9 +221,20 @@ app.use((req, res) => {
 initLocalBinaries();
 
 const server = app.listen(PORT, () => {
-  console.log(`VideoHunt v9.0 running at http://localhost:${PORT}`);
+  console.log(`VideoHunt v10.0 running at http://localhost:${PORT}`);
 });
 
+server.on('error', err => {
+  if (err && err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Close the existing VideoHunt terminal or stop the process using port ${PORT}.`);
+    process.exit(1);
+  }
+  console.error('[Server Error]:', err?.message || err);
+});
+
+// keep requestTimeout disabled for large video downloads while maintaining healthy keep-alive intervals
+// (setting keepAliveTimeout = 0 in Node 22+ causes immediate socket resets and "Failed to fetch" in Chrome)
 server.timeout = 0;
-server.keepAliveTimeout = 0;
-server.headersTimeout = 0;
+server.requestTimeout = 0;
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;

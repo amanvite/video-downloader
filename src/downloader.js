@@ -21,16 +21,31 @@ const {
 
 const sessionCache = new LruCache(300, 30 * 60 * 1000);
 const chunkProxyStore = new LruCache(500, 30 * 60 * 1000);
+const totalBytesCache = new LruCache(500, 30 * 60 * 1000);
 
-// 2 MB streaming range window so packets flow immediately without waiting for 8 MB ArrayBuffers
+// 2 MB streaming range window with 2-window parallel read-ahead prefetching
 const STREAM_WINDOW_BYTES = 2 * 1024 * 1024;
+const PREFETCH_AHEAD = 2;
 
-async function inspectMediaUrl(rawUrl) {
+let activeDownloads = 0;
+
+function getEngineStats() {
+  return {
+    cachedSessions: sessionCache.size(),
+    activeDownloads
+  };
+}
+
+async function inspectMediaUrl(rawUrl, forceRefresh = false) {
   const targetUrl = normalizeInputUrl(rawUrl);
 
-  const cached = sessionCache.get(targetUrl);
-  if (cached && cached.videoFormats?.length > 0) {
-    return cached;
+  if (!forceRefresh) {
+    const cached = sessionCache.get(targetUrl);
+    if (cached && cached.videoFormats?.length > 0) {
+      return cached;
+    }
+  } else {
+    sessionCache.delete(targetUrl);
   }
 
   // Tier 1: Fast native platform APIs
@@ -51,7 +66,7 @@ async function inspectMediaUrl(rawUrl) {
     }
   } catch {}
 
-  // Tier 3: Deep HTML / KVS / /embed/<id> / Child Iframe / Headless Browser Inspector
+  // Tier 3: Deep HTML / Balanced JSON / KVS / /embed/<id> / Child Iframe / Headless Browser Inspector
   try {
     const deepData = await scrapePageDeep(targetUrl);
     if (deepData && deepData.videoFormats?.length > 0) {
@@ -63,18 +78,24 @@ async function inspectMediaUrl(rawUrl) {
   return null;
 }
 
-// resolve exact total byte size of an upstream stream
 async function resolveUpstreamTotalBytes({ streamUrl, knownSize, userAgent, referer, cookies }) {
+  const cachedInfo = totalBytesCache.get(streamUrl);
+  if (cachedInfo) return cachedInfo;
+
   try {
     const parsed = new URL(streamUrl);
     const clen = parsed.searchParams.get('clen');
     if (clen && Number(clen) > 0) {
-      return { totalBytes: Number(clen), supportsRanges: true };
+      const info = { totalBytes: Number(clen), supportsRanges: true };
+      totalBytesCache.set(streamUrl, info);
+      return info;
     }
   } catch {}
 
   if (knownSize && Number(knownSize) > 0) {
-    return { totalBytes: Number(knownSize), supportsRanges: true };
+    const info = { totalBytes: Number(knownSize), supportsRanges: true };
+    totalBytesCache.set(streamUrl, info);
+    return info;
   }
 
   const controller = new AbortController();
@@ -100,18 +121,21 @@ async function resolveUpstreamTotalBytes({ streamUrl, knownSize, userAgent, refe
     try { probe.body?.cancel?.(); } catch {}
 
     if (probe.status === 206 && m?.[1]) {
-      return { totalBytes: Number(m[1]), supportsRanges: true };
+      const info = { totalBytes: Number(m[1]), supportsRanges: true };
+      totalBytesCache.set(streamUrl, info);
+      return info;
     }
 
     const len = Number(probe.headers.get('content-length') || 0);
-    return { totalBytes: len > 0 ? len : 0, supportsRanges: probe.status === 206 };
+    const info = { totalBytes: len > 0 ? len : 0, supportsRanges: probe.status === 206 };
+    if (info.totalBytes > 0) totalBytesCache.set(streamUrl, info);
+    return info;
   } catch {
     clearTimeout(timer);
     return { totalBytes: 0, supportsRanges: false };
   }
 }
 
-// open a single range window [start..end] and return the raw fetch response for immediate packet streaming
 async function openRangeWindowResponse({ streamUrl, start, end, userAgent, referer, cookies }) {
   const isGoogleVideo = /googlevideo\.com/i.test(streamUrl);
 
@@ -156,13 +180,12 @@ async function openRangeWindowResponse({ streamUrl, start, end, userAgent, refer
   }
 }
 
-// download a single range chunk into a Buffer (used for 4x parallel audio pre-staging)
 async function fetchRangeBuffer({ streamUrl, start, end, userAgent, referer, cookies }) {
   const res = await openRangeWindowResponse({ streamUrl, start, end, userAgent, referer, cookies });
   return Buffer.from(await res.arrayBuffer());
 }
 
-// pre-stage the small audio track (typically 2–4 MB) into temp/ using 4 parallel range workers in ~250ms
+// pre-stage the small audio track into temp/ using 4 parallel range workers in ~250ms
 async function prestageAudioTrackToFile({ audioUrl, knownSize, userAgent, referer, cookies }) {
   const { totalBytes } = await resolveUpstreamTotalBytes({
     streamUrl: audioUrl,
@@ -172,7 +195,7 @@ async function prestageAudioTrackToFile({ audioUrl, knownSize, userAgent, refere
     cookies
   });
 
-  if (!totalBytes || totalBytes <= 0 || totalBytes > 35 * 1024 * 1024) {
+  if (!totalBytes || totalBytes <= 0 || totalBytes > 40 * 1024 * 1024) {
     return null;
   }
 
@@ -181,7 +204,7 @@ async function prestageAudioTrackToFile({ audioUrl, knownSize, userAgent, refere
     `vh_audio_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.m4a`
   );
 
-  const partSize = 1024 * 1024; // 1 MB parallel parts
+  const partSize = 1024 * 1024;
   const parts = [];
   for (let start = 0; start < totalBytes; start += partSize) {
     parts.push({
@@ -215,7 +238,7 @@ async function prestageAudioTrackToFile({ audioUrl, knownSize, userAgent, refere
   return tempAudioPath;
 }
 
-// stream 2 MB range windows packet-by-packet with zero ArrayBuffer pauses
+// stream 2 MB range windows with a 2-window lookahead prefetch queue and immediate packet forwarding
 async function streamRangeWindowsToResponse({
   streamUrl,
   knownSize,
@@ -225,7 +248,8 @@ async function streamRangeWindowsToResponse({
   req,
   res,
   attachmentFilename = null,
-  mimeType = 'video/mp4'
+  mimeType = 'video/mp4',
+  isHead = false
 }) {
   let clientClosed = false;
   res.on('close', () => {
@@ -259,7 +283,7 @@ async function streamRangeWindowsToResponse({
       }
     }
 
-    const contentLength = endByte - startByte + 1;
+    const contentLength = Math.max(0, endByte - startByte + 1);
     if (attachmentFilename) {
       res.setHeader(
         'Content-Disposition',
@@ -270,64 +294,84 @@ async function streamRangeWindowsToResponse({
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Content-Length', String(contentLength));
     res.setHeader('Cache-Control', 'no-store');
+
+    if (isHead) {
+      res.end();
+      return true;
+    }
+
     res.flushHeaders();
 
+    const prefetchQueue = new Map();
+    const enqueuePrefetch = (winStart) => {
+      if (clientClosed || winStart > endByte || prefetchQueue.has(winStart)) return;
+      const winEnd = Math.min(winStart + STREAM_WINDOW_BYTES - 1, endByte);
+      const promise = openRangeWindowResponse({
+        streamUrl,
+        start: winStart,
+        end: winEnd,
+        userAgent,
+        referer,
+        cookies
+      }).catch(() => null);
+      prefetchQueue.set(winStart, { end: winEnd, promise });
+    };
+
     let cursor = startByte;
-    let nextWindowPromise = null;
-    let prefetchedStart = -1;
-    let prefetchedEnd = -1;
 
-    while (cursor <= endByte && !clientClosed && !res.writableEnded) {
-      const winEnd = Math.min(cursor + STREAM_WINDOW_BYTES - 1, endByte);
-
-      let currentResPromise;
-      if (nextWindowPromise && prefetchedStart === cursor && prefetchedEnd === winEnd) {
-        currentResPromise = nextWindowPromise;
-        nextWindowPromise = null;
-      } else {
-        currentResPromise = openRangeWindowResponse({
-          streamUrl,
-          start: cursor,
-          end: winEnd,
-          userAgent,
-          referer,
-          cookies
-        });
-      }
-
-      // pre-open the next 2 MB window connection in parallel while streaming current packets
-      const nextStart = winEnd + 1;
-      if (nextStart <= endByte && !clientClosed) {
-        prefetchedStart = nextStart;
-        prefetchedEnd = Math.min(nextStart + STREAM_WINDOW_BYTES - 1, endByte);
-        nextWindowPromise = openRangeWindowResponse({
-          streamUrl,
-          start: prefetchedStart,
-          end: prefetchedEnd,
-          userAgent,
-          referer,
-          cookies
-        }).catch(() => null);
-      }
-
-      const winRes = await currentResPromise;
-      let bytesReceivedInWindow = 0;
-
-      for await (const packet of winRes.body) {
-        if (clientClosed || res.writableEnded) {
-          try { winRes.body.cancel(); } catch {}
-          break;
+    try {
+      while (cursor <= endByte && !clientClosed && !res.writableEnded) {
+        // keep 2 upcoming 2 MB windows pre-opened in parallel
+        for (let k = 0; k <= PREFETCH_AHEAD; k++) {
+          enqueuePrefetch(cursor + k * STREAM_WINDOW_BYTES);
         }
-        const buf = Buffer.from(packet);
-        bytesReceivedInWindow += buf.length;
-        const canContinue = res.write(buf);
-        if (!canContinue) {
-          await new Promise(resolve => res.once('drain', resolve));
-        }
-      }
 
-      if (bytesReceivedInWindow <= 0) break;
-      cursor += bytesReceivedInWindow;
+        const entry = prefetchQueue.get(cursor);
+        prefetchQueue.delete(cursor);
+
+        const winEnd = Math.min(cursor + STREAM_WINDOW_BYTES - 1, endByte);
+        const winRes =
+          (entry ? await entry.promise : null) ||
+          (await openRangeWindowResponse({
+            streamUrl,
+            start: cursor,
+            end: winEnd,
+            userAgent,
+            referer,
+            cookies
+          }));
+
+        if (!winRes || !winRes.body) break;
+
+        let bytesReceivedInWindow = 0;
+        for await (const packet of winRes.body) {
+          if (clientClosed || res.writableEnded) {
+            try { winRes.body.cancel(); } catch {}
+            break;
+          }
+          const buf = Buffer.from(packet);
+          bytesReceivedInWindow += buf.length;
+          const canContinue = res.write(buf);
+          if (!canContinue) {
+            await new Promise(resolve => res.once('drain', resolve));
+          }
+        }
+
+        if (bytesReceivedInWindow <= 0) break;
+        cursor += bytesReceivedInWindow;
+      }
+    } finally {
+      // cancel any prefetched responses that were not consumed if client/FFmpeg closed early
+      for (const item of prefetchQueue.values()) {
+        item.promise
+          .then(r => {
+            if (r?.body) {
+              try { r.body.cancel(); } catch {}
+            }
+          })
+          .catch(() => {});
+      }
+      prefetchQueue.clear();
     }
 
     if (!res.writableEnded) {
@@ -336,12 +380,13 @@ async function streamRangeWindowsToResponse({
     return true;
   }
 
-  // Fallback for standard progressive servers without Range requirement
+  // Fallback for standard progressive servers without Range support
   const connectController = new AbortController();
   const connectTimer = setTimeout(() => connectController.abort(), 15000);
 
   try {
     const upstream = await fetch(streamUrl, {
+      method: isHead ? 'HEAD' : 'GET',
       headers: {
         'User-Agent': userAgent || BROWSER_UA,
         ...(!isGoogleVideo && referer ? { Referer: referer } : {}),
@@ -353,7 +398,7 @@ async function streamRangeWindowsToResponse({
     clearTimeout(connectTimer);
 
     const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
-    if (!upstream.ok || !upstream.body || contentType.includes('text/html')) {
+    if (!upstream.ok || contentType.includes('text/html')) {
       return false;
     }
 
@@ -369,6 +414,12 @@ async function streamRangeWindowsToResponse({
       res.setHeader('Content-Length', String(exactLen));
     }
     res.setHeader('Cache-Control', 'no-store');
+
+    if (isHead || !upstream.body) {
+      res.end();
+      return true;
+    }
+
     res.flushHeaders();
 
     const nodeStream = Readable.fromWeb(upstream.body);
@@ -387,7 +438,7 @@ async function streamRangeWindowsToResponse({
   }
 }
 
-async function handleInternalChunkProxy(req, res) {
+async function handleInternalChunkProxy(req, res, isHead = false) {
   const { token } = req.query || {};
   const meta = chunkProxyStore.get(token);
   if (!meta) {
@@ -403,7 +454,8 @@ async function handleInternalChunkProxy(req, res) {
     req,
     res,
     attachmentFilename: null,
-    mimeType: 'application/octet-stream'
+    mimeType: 'application/octet-stream',
+    isHead
   });
 }
 
@@ -486,8 +538,12 @@ function pipeProcessToResponse(proc, res, cleanFilename, mimeType, onCleanup = n
   });
 }
 
-// start downloading in Chrome's download manager immediately with continuous packet flow and unthrottled speed
 async function streamMediaToResponse({ url, title, type = 'mp4', resolution = '720', bitrate = '192', req, res }) {
+  activeDownloads++;
+  res.once('close', () => {
+    activeDownloads = Math.max(0, activeDownloads - 1);
+  });
+
   const ext = type === 'mp3' ? 'mp3' : 'mp4';
   const suffix = type === 'mp3' ? `${bitrate}kbps` : `${resolution}p`;
   const cleanFilename = sanitizeFilename(title, suffix, ext);
@@ -514,7 +570,7 @@ async function streamMediaToResponse({ url, title, type = 'mp4', resolution = '7
     ffmpegHeaders += `Cookie: ${sessionCookies}\r\n`;
   }
 
-  // PATH 1: High-Speed MP3 Audio Stream via Packet-Streaming Range Proxy -> FFmpeg pipe:1
+  // PATH 1: High-Speed MP3 Audio Stream via Lookahead Range Proxy -> FFmpeg pipe:1
   if (type === 'mp3') {
     const audioSourceUrl =
       session.bestAudioUrl ||
@@ -561,7 +617,7 @@ async function streamMediaToResponse({ url, title, type = 'mp4', resolution = '7
     }
   }
 
-  // PATH 2: Direct Progressive MP4 Stream via 2 MB Packet-Streaming Range Windows (shows exact total MB & time left)
+  // PATH 2: Direct Progressive MP4 Stream via 2-Window Lookahead Range Proxy (exact Content-Length)
   if (type !== 'mp3' && chosenStream?.progressiveUrl) {
     const pumped = await streamRangeWindowsToResponse({
       streamUrl: chosenStream.progressiveUrl,
@@ -582,7 +638,6 @@ async function streamMediaToResponse({ url, title, type = 'mp4', resolution = '7
     if (chosenStream.videoUrl && session.bestAudioUrl && chosenStream.videoUrl !== session.bestAudioUrl) {
       let localAudioFile = null;
       try {
-        // pre-stage the small audio file in 4 parallel range threads (~250ms) so the audio socket never idles or drops
         localAudioFile = await prestageAudioTrackToFile({
           audioUrl: session.bestAudioUrl,
           knownSize: session.bestAudioSize || null,
@@ -617,7 +672,6 @@ async function streamMediaToResponse({ url, title, type = 'mp4', resolution = '7
       };
 
       try {
-        // -frag_size 131072 and -flush_packets 1 force FFmpeg to emit fragments every 128 KB with zero dead-air pauses
         const proc = spawn(ffmpegBin, [
           '-loglevel', 'error',
           '-i', proxiedVideoUrl,
@@ -737,5 +791,6 @@ async function streamMediaToResponse({ url, title, type = 'mp4', resolution = '7
 module.exports = {
   inspectMediaUrl,
   streamMediaToResponse,
-  handleInternalChunkProxy
+  handleInternalChunkProxy,
+  getEngineStats
 };

@@ -79,6 +79,10 @@ class LruCache {
   delete(key) {
     this.store.delete(key);
   }
+
+  size() {
+    return this.store.size;
+  }
 }
 
 function normalizeInputUrl(rawInput) {

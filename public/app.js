@@ -108,12 +108,35 @@
     }
   }
 
+  // fetch helper with automatic 1x retry on transient keep-alive socket reset
+  async function postJsonWithRetry(endpoint, payload, signal) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+          signal
+        });
+      } catch (err) {
+        if (err.name === 'AbortError') throw err;
+        lastError = err;
+        if (attempt === 0) {
+          await new Promise(r => setTimeout(r, 350));
+        }
+      }
+    }
+    throw lastError;
+  }
+
   // 3. Custom Media Inspector Hook
   function useMediaInspector() {
     const [urlInput, setUrlInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
     const [loadingStage, setLoadingStage] = useState('');
     const [apologyText, setApologyText] = useState('');
+    const [canRetry, setCanRetry] = useState(false);
     const [mediaData, setMediaData] = useState(null);
     const [inspectedUrl, setInspectedUrl] = useState('');
     const [sitesCatalog, setSitesCatalog] = useState(() =>
@@ -130,6 +153,7 @@
         setApologyText(
           'We apologize, but VideoHunt is unable to extract a downloadable video from that link right now. Please try another video URL.'
         );
+        setCanRetry(false);
         window.history.replaceState({}, '', '/');
       }
 
@@ -154,7 +178,7 @@
       };
     }, []);
 
-    const inspectUrl = useCallback(async (rawUrl) => {
+    const inspectUrl = useCallback(async (rawUrl, forceRefresh = false) => {
       const normalized = normalizeClientUrl(rawUrl);
       if (!normalized) return false;
 
@@ -163,21 +187,25 @@
       abortControllerRef.current = controller;
 
       setIsLoading(true);
-      setLoadingStage('Connecting to media source & inspecting available streams...');
+      setLoadingStage('Connecting to media source and inspecting available streams...');
       setApologyText('');
+      setCanRetry(false);
       setMediaData(null);
 
-      const stageTimer = setTimeout(() => {
-        setLoadingStage('Deep-scanning video qualities & verifying H.264 stream tracks...');
-      }, 2800);
+      const stageTimer1 = setTimeout(() => {
+        setLoadingStage('Deep-scanning video qualities and verifying H.264 stream tracks...');
+      }, 2600);
+
+      const stageTimer2 = setTimeout(() => {
+        setLoadingStage('Resolving embedded player metadata and stream manifests...');
+      }, 7500);
 
       try {
-        const res = await fetch('/api/info', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: normalized }),
-          signal: controller.signal
-        });
+        const res = await postJsonWithRetry(
+          '/api/info',
+          { url: normalized, forceRefresh },
+          controller.signal
+        );
 
         const data = await res.json().catch(() => null);
         const hasStreams =
@@ -189,6 +217,7 @@
             data?.error ||
               'We apologize, but VideoHunt could not find any downloadable video streams on this link. Please verify that the URL points directly to a public video.'
           );
+          setCanRetry(true);
           return false;
         }
 
@@ -197,13 +226,27 @@
         return true;
       } catch (err) {
         if (err.name === 'AbortError') return false;
-        setApologyText(
-          err.message ||
-            'We apologize, but VideoHunt is temporarily unable to reach this video source.'
-        );
+
+        let serverOnline = false;
+        try {
+          const ping = await fetch('/api/health', { signal: AbortSignal.timeout(2000) });
+          serverOnline = ping.ok;
+        } catch {}
+
+        if (!serverOnline) {
+          setApologyText(
+            'Cannot reach the local VideoHunt server on localhost:3000. Make sure "npm start" is running in your terminal, then click Retry.'
+          );
+        } else {
+          setApologyText(
+            'The connection to this video source was interrupted before inspection completed. Click Retry to try again.'
+          );
+        }
+        setCanRetry(true);
         return false;
       } finally {
-        clearTimeout(stageTimer);
+        clearTimeout(stageTimer1);
+        clearTimeout(stageTimer2);
         setIsLoading(false);
         setLoadingStage('');
       }
@@ -214,6 +257,7 @@
       setUrlInput('');
       setMediaData(null);
       setApologyText('');
+      setCanRetry(false);
       setIsLoading(false);
       setLoadingStage('');
     }, []);
@@ -224,7 +268,7 @@
       isLoading,
       loadingStage,
       apologyText,
-      setApologyText,
+      canRetry,
       mediaData,
       inspectedUrl,
       sitesCatalog,
@@ -233,7 +277,28 @@
     };
   }
 
-  // 4. Studio Media Card Component
+  // 4. Skeleton Loading Card
+  function InspectorSkeleton() {
+    return html`
+      <div className="skeleton-card" aria-hidden="true">
+        <div className="skeleton-top">
+          <div className="skeleton-box skeleton-thumb"></div>
+          <div className="skeleton-lines">
+            <div className="skeleton-box" style=${{ height: '22px', width: '78%' }}></div>
+            <div className="skeleton-box" style=${{ height: '16px', width: '48%' }}></div>
+            <div className="skeleton-box" style=${{ height: '38px', width: '62%', marginTop: '8px' }}></div>
+          </div>
+        </div>
+        <div className="skeleton-rows">
+          <div className="skeleton-box" style=${{ height: '48px', width: '100%' }}></div>
+          <div className="skeleton-box" style=${{ height: '48px', width: '100%' }}></div>
+          <div className="skeleton-box" style=${{ height: '48px', width: '100%' }}></div>
+        </div>
+      </div>
+    `;
+  }
+
+  // 5. Studio Media Card Component
   function buildDirectDownloadHref({ url, title, type = 'mp4', resolution = 720, bitrate = 192 }) {
     const params = new URLSearchParams({
       url,
@@ -245,7 +310,7 @@
     return `/api/download?${params.toString()}`;
   }
 
-  function InspectorCard({ mediaData, sourceUrl }) {
+  function InspectorCard({ mediaData, sourceUrl, onNotifyDownload, onRefreshInspect }) {
     const videoFormats = Array.isArray(mediaData?.videoFormats)
       ? mediaData.videoFormats
       : (mediaData?.resolutions || []).map(r => ({
@@ -264,6 +329,7 @@
       : '';
 
     const [selectedPreset, setSelectedPreset] = useState(defaultPreset);
+    const [formatTab, setFormatTab] = useState('all');
     const [thumbFailed, setThumbFailed] = useState(false);
 
     useEffect(() => {
@@ -271,6 +337,7 @@
       const firstAudio = mediaData?.audioFormats?.[0]?.bitrate;
       if (firstVideo) setSelectedPreset(`mp4:${firstVideo}`);
       else if (firstAudio) setSelectedPreset(`mp3:${firstAudio}`);
+      setFormatTab('all');
       setThumbFailed(false);
     }, [mediaData]);
 
@@ -285,6 +352,9 @@
     const proxiedThumb = mediaData.thumbnail
       ? `/api/proxy-image?url=${encodeURIComponent(mediaData.thumbnail)}`
       : '';
+
+    const showVideoSection = formatTab === 'all' || formatTab === 'video';
+    const showAudioSection = (formatTab === 'all' || formatTab === 'audio') && audioFormats.length > 0;
 
     return html`
       <div className="inspector-card">
@@ -344,6 +414,12 @@
                 href=${buildDirectDownloadHref(primaryParams)}
                 className="btn-download-main"
                 download
+                onClick=${() =>
+                  onNotifyDownload(
+                    selType === 'mp3'
+                      ? `Starting MP3 (${selVal} kbps) download...`
+                      : `Starting MP4 ${selVal}p download...`
+                  )}
               >
                 Download Now
               </a>
@@ -351,83 +427,126 @@
           </div>
         </div>
 
-        <div className="stream-group-header">
-          <span>Available Video Streams (MP4)</span>
-          <span>Codec & Size</span>
-        </div>
-
-        <div className="stream-bento-list">
-          ${videoFormats.map(vf => {
-            const res = vf.resolution;
-            const isUhd = res >= 1440;
-            const badge =
-              res >= 2160
-                ? '4K UHD'
-                : res >= 1440
-                ? '2K QHD'
-                : res >= 1080
-                ? 'Full HD'
-                : res >= 720
-                ? 'HD'
-                : 'SD';
-            const rowParams = { url: sourceUrl, title: mediaData.title, type: 'mp4', resolution: res };
-            const rowKey = `mp4-${res}`;
-            return html`
-              <div key=${rowKey} className="stream-bento-row">
-                <div className="stream-row-left">
-                  <span className="stream-format-name">MP4 ${res}p</span>
-                  <span className=${`res-tag ${isUhd ? 'uhd' : ''}`}>${badge}</span>
-                  <span className="stream-spec-meta">${vf.codec || 'Video (H.264 + AAC)'}</span>
-                  ${vf.sizeText && html`<span className="size-pill">${vf.sizeText}</span>`}
-                </div>
-
-                <a
-                  href=${buildDirectDownloadHref(rowParams)}
-                  className="table-dl-btn"
-                  download
-                >
-                  Download ${res}p MP4
-                </a>
-              </div>
-            `;
-          })}
-        </div>
-
-        ${audioFormats.length > 0 && html`
-          <div className="stream-group-header" style=${{ marginTop: '20px' }}>
-            <span>Direct Audio Extraction (MP3)</span>
-            <span>Bitrate Profile</span>
+        <div className="format-tabs-bar">
+          <div className="format-tabs-group">
+            <button
+              type="button"
+              className=${`format-tab-btn ${formatTab === 'all' ? 'active' : ''}`}
+              onClick=${() => setFormatTab('all')}
+            >
+              All Formats (${videoFormats.length + audioFormats.length})
+            </button>
+            <button
+              type="button"
+              className=${`format-tab-btn ${formatTab === 'video' ? 'active' : ''}`}
+              onClick=${() => setFormatTab('video')}
+            >
+              Video MP4 (${videoFormats.length})
+            </button>
+            <button
+              type="button"
+              className=${`format-tab-btn ${formatTab === 'audio' ? 'active' : ''}`}
+              onClick=${() => setFormatTab('audio')}
+            >
+              Audio MP3 (${audioFormats.length})
+            </button>
           </div>
 
-          <div className="stream-bento-list">
-            ${audioFormats.map(item => {
-              const rowParams = { url: sourceUrl, title: mediaData.title, type: 'mp3', bitrate: item.bitrate };
-              const rowKey = `mp3-${item.bitrate}`;
-              return html`
-                <div key=${rowKey} className="stream-bento-row">
-                  <div className="stream-row-left">
-                    <span className="stream-format-name">MP3 ${item.label}</span>
-                    <span className="res-tag audio-tag">AUDIO</span>
-                    <span className="stream-spec-meta">${item.desc} • All Media Players</span>
-                  </div>
+          <button
+            type="button"
+            className="refresh-streams-btn"
+            onClick=${onRefreshInspect}
+            title="Re-fetch fresh stream links"
+          >
+            Refresh Links
+          </button>
+        </div>
 
-                  <a
-                    href=${buildDirectDownloadHref(rowParams)}
-                    className="table-dl-btn audio-dl-btn"
-                    download
-                  >
-                    Download MP3
-                  </a>
-                </div>
-              `;
-            })}
+        ${showVideoSection && html`
+          <div>
+            <div className="stream-group-header">
+              <span>Available Video Streams (MP4)</span>
+              <span>Codec & Size</span>
+            </div>
+
+            <div className="stream-bento-list">
+              ${videoFormats.map(vf => {
+                const res = vf.resolution;
+                const isUhd = res >= 1440;
+                const badge =
+                  res >= 2160
+                    ? '4K UHD'
+                    : res >= 1440
+                    ? '2K QHD'
+                    : res >= 1080
+                    ? 'Full HD'
+                    : res >= 720
+                    ? 'HD'
+                    : 'SD';
+                const rowParams = { url: sourceUrl, title: mediaData.title, type: 'mp4', resolution: res };
+                const rowKey = `mp4-${res}`;
+                return html`
+                  <div key=${rowKey} className="stream-bento-row">
+                    <div className="stream-row-left">
+                      <span className="stream-format-name">MP4 ${res}p</span>
+                      <span className=${`res-tag ${isUhd ? 'uhd' : ''}`}>${badge}</span>
+                      <span className="stream-spec-meta">${vf.codec || 'Video (H.264 + AAC)'}</span>
+                      ${vf.sizeText && html`<span className="size-pill">${vf.sizeText}</span>`}
+                    </div>
+
+                    <a
+                      href=${buildDirectDownloadHref(rowParams)}
+                      className="table-dl-btn"
+                      download
+                      onClick=${() => onNotifyDownload(`Starting MP4 ${res}p download...`)}
+                    >
+                      Download ${res}p MP4
+                    </a>
+                  </div>
+                `;
+              })}
+            </div>
+          </div>
+        `}
+
+        ${showAudioSection && html`
+          <div>
+            <div className="stream-group-header" style=${{ marginTop: '20px' }}>
+              <span>Direct Audio Extraction (MP3)</span>
+              <span>Bitrate Profile</span>
+            </div>
+
+            <div className="stream-bento-list">
+              ${audioFormats.map(item => {
+                const rowParams = { url: sourceUrl, title: mediaData.title, type: 'mp3', bitrate: item.bitrate };
+                const rowKey = `mp3-${item.bitrate}`;
+                return html`
+                  <div key=${rowKey} className="stream-bento-row">
+                    <div className="stream-row-left">
+                      <span className="stream-format-name">MP3 ${item.label}</span>
+                      <span className="res-tag audio-tag">AUDIO</span>
+                      <span className="stream-spec-meta">${item.desc} / All Media Players</span>
+                    </div>
+
+                    <a
+                      href=${buildDirectDownloadHref(rowParams)}
+                      className="table-dl-btn audio-dl-btn"
+                      download
+                      onClick=${() => onNotifyDownload(`Starting MP3 ${item.label} download...`)}
+                    >
+                      Download MP3
+                    </a>
+                  </div>
+                `;
+              })}
+            </div>
           </div>
         `}
       </div>
     `;
   }
 
-  // 5. Sites Directory View
+  // 6. Sites Directory View
   function SitesView({ sitesCatalog, onSelectSite, onBackHome }) {
     const [selectedCategory, setSelectedCategory] = useState('all');
 
@@ -447,7 +566,7 @@
             className="cat-filter-pill"
             onClick=${onBackHome}
           >
-            ← Back to Downloader
+            Back to Downloader
           </button>
           ${[
             { id: 'all', label: 'All Resources' },
@@ -468,7 +587,7 @@
 
         <div className="sites-section">
           <div className="sites-section-header">
-            <span className="sites-section-title">Supported Sites & Converters (A–Z)</span>
+            <span className="sites-section-title">Supported Sites & Converters (A-Z)</span>
             <span className="sites-count-badge">${filteredSites.length} resources</span>
           </div>
 
@@ -497,11 +616,12 @@
     `;
   }
 
-  // 6. Root Application Component
+  // 7. Root Application Component
   function App() {
     const [activeView, setActiveView] = useState('home');
     const [selectedSite, setSelectedSite] = useState(null);
     const [inputUnlocked, setInputUnlocked] = useState(false);
+    const [toastMessage, setToastMessage] = useState('');
 
     const {
       urlInput,
@@ -509,6 +629,7 @@
       isLoading,
       loadingStage,
       apologyText,
+      canRetry,
       mediaData,
       inspectedUrl,
       sitesCatalog,
@@ -517,7 +638,31 @@
     } = useMediaInspector();
 
     const inputRef = useRef(null);
+    const toastTimerRef = useRef(null);
     const detectedHost = useMemo(() => detectHostLabel(urlInput), [urlInput]);
+
+    const showToast = useCallback((msg) => {
+      setToastMessage(msg);
+      if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+      toastTimerRef.current = setTimeout(() => setToastMessage(''), 3200);
+    }, []);
+
+    // keyboard shortcuts: "/" focuses search input, "Escape" clears input
+    useEffect(() => {
+      const onKeyDown = (e) => {
+        if (activeView !== 'home') return;
+        const activeTag = document.activeElement?.tagName;
+        if (e.key === '/' && activeTag !== 'INPUT' && activeTag !== 'TEXTAREA') {
+          e.preventDefault();
+          setInputUnlocked(true);
+          inputRef.current?.focus();
+        } else if (e.key === 'Escape' && activeTag === 'INPUT') {
+          resetInspector();
+        }
+      };
+      window.addEventListener('keydown', onKeyDown);
+      return () => window.removeEventListener('keydown', onKeyDown);
+    }, [activeView, resetInspector]);
 
     const switchView = (viewName) => {
       setActiveView(viewName);
@@ -527,12 +672,33 @@
     const handleSelectSite = (siteLabel) => {
       setSelectedSite(siteLabel);
       switchView('home');
-      setTimeout(() => inputRef.current?.focus(), 100);
+      setTimeout(() => {
+        setInputUnlocked(true);
+        inputRef.current?.focus();
+      }, 100);
+    };
+
+    const handlePasteFromClipboard = async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (text && text.trim()) {
+          setInputUnlocked(true);
+          setUrlInput(text.trim());
+          await inspectUrl(text.trim());
+        } else {
+          setInputUnlocked(true);
+          inputRef.current?.focus();
+        }
+      } catch {
+        setInputUnlocked(true);
+        inputRef.current?.focus();
+      }
     };
 
     const handleFormSubmit = async (e) => {
       e.preventDefault();
       if (!urlInput.trim()) {
+        setInputUnlocked(true);
         inputRef.current?.focus();
         return;
       }
@@ -600,6 +766,16 @@
                     autoCapitalize="off"
                     spellCheck="false"
                   />
+                  ${!urlInput && html`
+                    <button
+                      type="button"
+                      className="omnibox-paste-btn"
+                      onClick=${handlePasteFromClipboard}
+                      title="Paste link from clipboard"
+                    >
+                      Paste
+                    </button>
+                  `}
                   ${urlInput && html`
                     <button
                       type="button"
@@ -640,16 +816,29 @@
                   <div className="stage-status-pill">${loadingStage}</div>
                 `}
                 ${apologyText && html`
-                  <div className="apology-banner">
-                    ${apologyText}
+                  <div className=${`apology-banner ${canRetry && urlInput.trim() ? '' : 'centered'}`}>
+                    <span>${apologyText}</span>
+                    ${canRetry && urlInput.trim() && html`
+                      <button
+                        type="button"
+                        className="retry-inline-btn"
+                        onClick=${() => inspectUrl(urlInput, true)}
+                      >
+                        Retry
+                      </button>
+                    `}
                   </div>
                 `}
               </div>
+
+              ${isLoading && !mediaData && html`<${InspectorSkeleton} />`}
 
               ${mediaData && html`
                 <${InspectorCard}
                   mediaData=${mediaData}
                   sourceUrl=${inspectedUrl}
+                  onNotifyDownload=${showToast}
+                  onRefreshInspect=${() => inspectUrl(inspectedUrl, true)}
                 />
               `}
 
@@ -673,10 +862,10 @@
 
               <div className="seo-description-block">
                 <p>
-                  Want to save your favorite videos for offline viewing? Our powerful ${selectedSite || 'online'} video downloader provides exactly what you're looking for. Get high-quality downloads with rapid processing through a simple and intuitive interface. Our free ${selectedSite || 'VideoHunt'} downloader offers ultimate convenience for every user.
+                  VideoHunt makes it easy to save ${selectedSite ? `${selectedSite} ` : ''}videos and audio directly to your device for offline viewing. Just paste a link, pick the quality you want, and start downloading right away.
                 </p>
                 <p>
-                  Need a dependable ${selectedSite || 'video'} downloader? You've discovered the ideal solution. Our optimized video downloader lets you save authorized, public-domain, and creator-owned videos straight to your device with complete convenience and reliable performance. Choose our top-rated ${selectedSite || 'VideoHunt'} downloader for professional-quality results each time.
+                  It checks every link in real time so you only see the MP4 video and MP3 audio options that are actually available. Use it only for your own content, public-domain media, or videos you have permission to download.
                 </p>
               </div>
             </section>
@@ -695,15 +884,17 @@
 
         </main>
 
-        <footer className="app-footer">
-          <div className="footer-short-divider"></div>
-          <div className="footer-copyright">© 2026 VideoHunt. All rights reserved.</div>
-        </footer>
+        ${toastMessage && html`
+          <div className="toast-notice" role="status">
+            <span className="toast-dot"></span>
+            <span>${toastMessage}</span>
+          </div>
+        `}
       </div>
     `;
   }
 
-  // 7. Mount Application
+  // 8. Mount Application
   const container = document.getElementById('root');
   if (container) {
     const root = window.ReactDOM.createRoot(container);
