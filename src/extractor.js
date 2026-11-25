@@ -15,7 +15,14 @@ const {
   resolveAbsoluteUrl
 } = require('./config');
 
-const BINARY_FILENAME = process.platform === 'win32' ? 'yt-dlp.exe' : 'yt-dlp';
+const BINARY_FILENAME =
+  process.platform === 'win32'
+    ? 'yt-dlp.exe'
+    : process.platform === 'darwin'
+    ? 'yt-dlp_macos'
+    : process.arch === 'arm64'
+    ? 'yt-dlp_linux_aarch64'
+    : 'yt-dlp_linux';
 const LOCAL_YTDLP_BIN = path.join(TEMP_DIR, BINARY_FILENAME);
 
 let resolvedYtDlpCmd = null;
